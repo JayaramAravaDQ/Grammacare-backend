@@ -16,6 +16,17 @@ from .data import (
 )
 from .models import Consultation
 
+# Load .env from backend project root so GEMINI_API_KEY can be set there (not in the UI repo)
+_backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_env_path = os.path.join(_backend_root, ".env")
+if os.path.isfile(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _, _v = _line.partition("=")
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 # Dummy users (same as lib/auth-context.tsx)
 DUMMY_USERS = [
     {"email": "admin@grammacare.com", "password": "admin123", "name": "Dr. Admin"},
@@ -25,6 +36,7 @@ DUMMY_USERS = [
 ]
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+print("GEMINI_API_KEY", GEMINI_API_KEY)
 GEMINI_MODEL = "gemini-2.5-flash-lite"
 AI_NAME = "GrammaCare AI"
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
