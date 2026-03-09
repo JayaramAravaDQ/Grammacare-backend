@@ -2,6 +2,7 @@ import json
 import os
 import re
 import requests
+import boto3
 from django.http import JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
@@ -16,7 +17,7 @@ from .data import (
 )
 from .models import Consultation
 
-# Load .env from backend project root so GEMINI_API_KEY can be set there (not in the UI repo)
+# Load .env from backend project root (AWS keys, optional BEDROCK_MODEL_ID)
 _backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _env_path = os.path.join(_backend_root, ".env")
 if os.path.isfile(_env_path):
@@ -35,11 +36,9 @@ DUMMY_USERS = [
     {"email": "demo@grammacare.com", "password": "demo123", "name": "Demo User"},
 ]
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-print("GEMINI_API_KEY", GEMINI_API_KEY)
-GEMINI_MODEL = "gemini-2.5-flash-lite"
 AI_NAME = "GrammaCare AI"
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "meta.llama3-8b-instruct-v1:0")
+AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 
 SYSTEM_INSTRUCTION = f"""
 You are {AI_NAME} — a compassionate, experienced virtual healthcare assistant.
@@ -78,23 +77,26 @@ RESPONSE FORMATTING RULES (STRICTLY FOLLOW):
 """
 
 
-def ask_gemini(prompt: str, patient_name: str = "") -> str:
-    if not GEMINI_API_KEY or GEMINI_API_KEY == "your_gemini_api_key_here":
-        return f"[{AI_NAME} Error: Please configure GEMINI_API_KEY in your environment variables. Get a free API key from https://aistudio.google.com/apikey]"
+def ask_bedrock(prompt: str, patient_name: str = "") -> str:
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID")
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    if not access_key or not secret_key:
+        return f"[{AI_NAME} Error: Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in .env]"
     try:
+        session = boto3.Session(
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            region_name=AWS_REGION,
+        )
+        client = session.client("bedrock-runtime")
         full_prompt = f"Patient name: {patient_name}\n\n{prompt}" if patient_name else prompt
-        payload = {
-            "system_instruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
-            "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
-            "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024},
-        }
-        url = f"{GEMINI_API_URL}?key={GEMINI_API_KEY}"
-        resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"}, timeout=30)
-        result = resp.json()
-        if result.get("error"):
-            err = result["error"]
-            return f"[API Error {err.get('code', '')}: {err.get('message', 'Unknown error')}]"
-        text = (result.get("candidates") or [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        response = client.converse(
+            modelId=BEDROCK_MODEL_ID,
+            system=[{"text": SYSTEM_INSTRUCTION}],
+            messages=[{"role": "user", "content": [{"text": full_prompt}]}],
+            inferenceConfig={"temperature": 0.7, "maxTokens": 1024},
+        )
+        text = response["output"]["message"]["content"][0]["text"]
         return (text or f"[{AI_NAME} temporarily unavailable]").strip()
     except Exception as e:
         return f"[{AI_NAME} temporarily unavailable: {e}]"
@@ -203,7 +205,7 @@ def chat_view(request):
     location_source = body.get("locationSource", "")
 
     if action == "greeting":
-        msg = ask_gemini(
+        msg = ask_bedrock(
             f"Give a warm, friendly greeting to the patient named {patient_name} as {AI_NAME}. "
             "Welcome them to the health consultation. Tell them they can describe their main symptom "
             "and you'll guide them through the rest. Keep it to 3-4 sentences. Be warm and reassuring.",
@@ -212,7 +214,7 @@ def chat_view(request):
         return JsonResponse({"message": msg})
 
     if action == "ask_symptom":
-        msg = ask_gemini(
+        msg = ask_bedrock(
             f"As {AI_NAME}, politely ask the patient {patient_name} to tell you their main symptom. "
             "Encourage them to describe it in simple terms (e.g., cough, fever, itching, headache). "
             "Keep it to 2-3 sentences. Friendly and inviting tone.",
@@ -247,7 +249,7 @@ def chat_view(request):
         same = primary_disease == second_disease
         symptoms_str = ", ".join(symptom_display(s) for s in all_symptoms)
         precautions_str = ", ".join(precautions)
-        diagnosis = ask_gemini(
+        diagnosis = ask_bedrock(
             f"You are {AI_NAME} giving a diagnosis summary to patient {patient_name}.\n\n"
             f"Primary diagnosis  : {primary_disease}\n"
             f"Secondary diagnosis: {'Same as primary -- both models agree, high confidence!' if same else second_disease}\n"
@@ -283,7 +285,7 @@ def chat_view(request):
             geo = _reverse_geocode(float(lat), float(lon))
             if geo:
                 location_str = ", ".join(filter(None, [geo.get("area"), geo.get("city")])) or "their area"
-        msg = ask_gemini(
+        msg = ask_bedrock(
             f"Patient {patient_name} has been tentatively diagnosed with: {otc_disease}\n"
             f"Severity: {severity_level}\n"
             f"Location: {location_str}\n\n"
@@ -355,7 +357,7 @@ def chat_view(request):
         if location_info.get("lat") is not None and location_info.get("lon") is not None:
             coords_info = f"GPS Coordinates: {location_info['lat']:.6f}, {location_info['lon']:.6f}\n"
         area = location_info.get("area") or "a suburb"
-        msg = ask_gemini(
+        msg = ask_bedrock(
             f"The patient {patient_name} has been diagnosed with: {hosp_disease}\n"
             f"Their detected location is: {location_str}\n"
             f"{coords_info}"
@@ -381,7 +383,7 @@ def chat_view(request):
 
     if action == "farewell":
         farewell_dis = data.get("disease") or "their health concern"
-        msg = ask_gemini(
+        msg = ask_bedrock(
             f"Give a warm goodbye message as {AI_NAME} to patient {patient_name} who consulted about {farewell_dis}. "
             "Wish them a speedy recovery, remind them to follow the precautions, "
             "and encourage them to visit a real doctor. Keep it to 2-3 sentences. Warm and hopeful.",
@@ -391,7 +393,7 @@ def chat_view(request):
 
     if action == "free_chat":
         message = data.get("message") or ""
-        msg = ask_gemini(
+        msg = ask_bedrock(
             f'The patient {patient_name} says: "{message}"\n\n'
             f"As {AI_NAME}, respond helpfully. If it's a health-related question, provide guidance. "
             "If they want to start a new consultation, guide them. Keep it conversational and warm.",
